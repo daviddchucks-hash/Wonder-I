@@ -349,6 +349,18 @@ body.modal-open{overflow:hidden;}
 .detail-meta-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:14px;}
 .detail-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);}
 
+/* ---------- loading screen ---------- */
+.loading-screen{
+  min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+  color:var(--text-secondary);font-size:13.5px;
+}
+.loading-screen .auth-wordmark{font-family:var(--font-display);font-size:26px;color:var(--primary);}
+.loading-spinner{
+  width:26px;height:26px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--primary);
+  animation:wonderi-spin .8s linear infinite;
+}
+@keyframes wonderi-spin{to{transform:rotate(360deg);}}
+
 /* ---------- auth screens ---------- */
 .auth-screen{min-height:100vh;display:flex;flex-direction:column;justify-content:center;padding:32px 24px;max-width:420px;margin:0 auto;}
 .auth-brand{text-align:center;margin-bottom:34px;}

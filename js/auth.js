@@ -1,76 +1,126 @@
-// auth.js — account management. There is no server in this build, so "forgot password"
-// is handled via a security question set at signup rather than an email link.
-import { uid, simpleHash } from './utils.js';
-import * as db from './db.js';
+// auth.js — real accounts via Firebase Authentication (email/password).
+// Session persistence, password hashing, and password-reset emails are all handled by Firebase.
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut as fbSignOut,
+  onAuthStateChanged,
+  updateProfile as fbUpdateProfile,
+  sendPasswordResetEmail,
+  reauthenticateWithCredential,
+  updatePassword as fbUpdatePassword,
+  updateEmail as fbUpdateEmail,
+  EmailAuthProvider,
+} from 'https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js';
+import { doc, setDoc, getDoc, serverTimestamp } from 'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
+import { auth, fs } from './firebase.js';
 
+// A plain, view-friendly snapshot of the signed-in user: { uid, name, email }.
 export let currentUser = null;
 
-export function restoreSession() {
-  const session = db.getSession();
-  if (!session) return false;
-  const user = db.getUsers().find(u => u.id === session.userId);
-  if (!user) { db.clearSession(); return false; }
-  currentUser = user;
-  db.loadData(user.id);
-  return true;
+function syncCurrentUser(fbUser) {
+  currentUser = fbUser ? { uid: fbUser.uid, name: fbUser.displayName || 'Friend', email: fbUser.email } : null;
+  return currentUser;
 }
 
-export function signup({ name, email, password, securityQuestion, securityAnswer }) {
-  email = email.trim().toLowerCase();
+// Fires immediately with the restored session (or null) on page load, and again on
+// every login/logout. This replaces all custom "session" storage.
+export function onAuthReady(callback) {
+  return onAuthStateChanged(auth, async fbUser => {
+    syncCurrentUser(fbUser);
+    callback(currentUser);
+  });
+}
+
+async function ensureUserDoc(uid, data) {
+  const ref = doc(fs, 'users', uid);
+  const snap = await getDoc(ref);
+  if (!snap.exists()) {
+    await setDoc(ref, { ...data, createdAt: serverTimestamp() });
+  }
+}
+
+export async function signup({ name, email, password }) {
+  name = (name || '').trim();
+  email = (email || '').trim().toLowerCase();
   if (!name || !email || !password) return { error: 'Please fill in your name, email and password.' };
   if (password.length < 6) return { error: 'Password must be at least 6 characters.' };
-  if (db.findUserByEmail(email)) return { error: 'An account with this email already exists.' };
-  const user = {
-    id: uid(),
-    name: name.trim(),
-    email,
-    passwordHash: simpleHash(password),
-    securityQuestion: securityQuestion || 'What city were you born in?',
-    securityAnswerHash: simpleHash((securityAnswer || '').trim().toLowerCase()),
-    createdAt: new Date().toISOString(),
-    theme: 'light'
-  };
-  db.createUser(user);
-  currentUser = user;
-  db.loadData(user.id);
-  db.setSession(user.id);
-  return { user };
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    await fbUpdateProfile(cred.user, { displayName: name });
+    await ensureUserDoc(cred.user.uid, { name, email });
+    syncCurrentUser({ ...cred.user, displayName: name });
+    return { user: currentUser };
+  } catch (e) {
+    return { error: friendlyError(e) };
+  }
 }
 
-export function login({ email, password }) {
+export async function login({ email, password }) {
   email = (email || '').trim().toLowerCase();
-  const user = db.findUserByEmail(email);
-  if (!user || user.passwordHash !== simpleHash(password)) {
-    return { error: 'Incorrect email or password.' };
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    syncCurrentUser(cred.user);
+    return { user: currentUser };
+  } catch (e) {
+    return { error: friendlyError(e) };
   }
-  currentUser = user;
-  db.loadData(user.id);
-  db.setSession(user.id);
-  return { user };
 }
 
-export function logout() {
+export async function logout() {
+  await fbSignOut(auth);
   currentUser = null;
-  db.clearSession();
 }
 
-export function getSecurityQuestion(email) {
-  const user = db.findUserByEmail((email || '').trim().toLowerCase());
-  return user ? user.securityQuestion : null;
-}
-
-export function resetPassword({ email, securityAnswer, newPassword }) {
-  const user = db.findUserByEmail((email || '').trim().toLowerCase());
-  if (!user) return { error: 'No account found with that email.' };
-  if (user.securityAnswerHash !== simpleHash((securityAnswer || '').trim().toLowerCase())) {
-    return { error: 'That answer doesn\u2019t match our records.' };
+export async function sendReset(email) {
+  try {
+    await sendPasswordResetEmail(auth, (email || '').trim().toLowerCase());
+    return { success: true };
+  } catch (e) {
+    return { error: friendlyError(e) };
   }
-  if (!newPassword || newPassword.length < 6) return { error: 'New password must be at least 6 characters.' };
-  db.updateUser(user.id, { passwordHash: simpleHash(newPassword) });
-  return { success: true };
 }
 
-export function updateProfile(patch) {
-  currentUser = db.updateUser(currentUser.id, patch);
-  return currentUser;
+export async function updateProfile({ name, email }) {
+  try {
+    if (name && name !== currentUser.name) {
+      await fbUpdateProfile(auth.currentUser, { displayName: name });
+    }
+    if (email && email !== currentUser.email) {
+      await fbUpdateEmail(auth.currentUser, email);
+    }
+    await setDoc(doc(fs, 'users', currentUser.uid), { name, email }, { merge: true });
+    syncCurrentUser(auth.currentUser);
+    return { user: currentUser };
+  } catch (e) {
+    return { error: friendlyError(e) };
+  }
+}
+
+export async function changePassword({ currentPassword, newPassword }) {
+  if (!newPassword || newPassword.length < 6) return { error: 'New password must be at least 6 characters.' };
+  try {
+    const cred = EmailAuthProvider.credential(currentUser.email, currentPassword);
+    await reauthenticateWithCredential(auth.currentUser, cred);
+    await fbUpdatePassword(auth.currentUser, newPassword);
+    return { success: true };
+  } catch (e) {
+    return { error: friendlyError(e) };
+  }
+}
+
+function friendlyError(e) {
+  const code = e?.code || '';
+  const map = {
+    'auth/email-already-in-use': 'An account with this email already exists.',
+    'auth/invalid-email': 'That email address doesn\u2019t look right.',
+    'auth/user-not-found': 'No account found with that email.',
+    'auth/wrong-password': 'Incorrect email or password.',
+    'auth/invalid-credential': 'Incorrect email or password.',
+    'auth/too-many-requests': 'Too many attempts. Please wait a moment and try again.',
+    'auth/weak-password': 'Password must be at least 6 characters.',
+    'auth/requires-recent-login': 'Please log out and back in, then try again.',
+    'auth/network-request-failed': 'Network error \u2014 check your connection and try again.',
+  };
+  return map[code] || (e?.message ? e.message.replace(/^Firebase:\s*/, '') : 'Something went wrong. Please try again.');
 }

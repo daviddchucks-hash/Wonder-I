@@ -1,13 +1,12 @@
-// db.js — local persistence layer. Each signed-in user's data lives under its own
-// namespaced key so accounts never see each other's data on the same device.
+// db.js — persistence layer backed by Cloud Firestore. Each account's data lives in a
+// single document at userData/{uid}, scoped by Firestore security rules to that uid only.
+// The rest of the app (every view file) reads/writes through a synchronous in-memory
+// cache — exactly like the old localStorage version — so no view code needs to change.
+// Writes are pushed to Firestore in the background and retried by Firestore's own
+// offline queue if the network is down.
+import { doc, getDoc, setDoc } from 'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
+import { fs } from './firebase.js';
 import { uid, todayStr, dowIndex, daysBetween, pct, clamp } from './utils.js';
-
-const USERS_KEY = 'wonderi_users';
-const SESSION_KEY = 'wonderi_session';
-
-function dataKey(userId) {
-  return `wonderi_data_${userId}`;
-}
 
 export const DEFAULT_CATEGORIES = [
   'Career', 'Finance', 'Health', 'Personal', 'Learning', 'Relationships', 'Creativity', 'Other'
@@ -34,57 +33,52 @@ function emptyUserData() {
   };
 }
 
-// ---------- users / auth storage ----------
-export function getUsers() {
-  return JSON.parse(localStorage.getItem(USERS_KEY) || '[]');
-}
-function saveUsers(users) {
-  localStorage.setItem(USERS_KEY, JSON.stringify(users));
-}
-export function findUserByEmail(email) {
-  return getUsers().find(u => u.email.toLowerCase() === email.toLowerCase());
-}
-export function createUser(user) {
-  const users = getUsers();
-  users.push(user);
-  saveUsers(users);
-  localStorage.setItem(dataKey(user.id), JSON.stringify(emptyUserData()));
-}
-export function updateUser(userId, patch) {
-  const users = getUsers();
-  const idx = users.findIndex(u => u.id === userId);
-  if (idx === -1) return null;
-  users[idx] = { ...users[idx], ...patch };
-  saveUsers(users);
-  return users[idx];
-}
-export function getSession() {
-  return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
-}
-export function setSession(userId) {
-  localStorage.setItem(SESSION_KEY, JSON.stringify({ userId }));
-}
-export function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
-}
-
-// ---------- per-user data ----------
 let cache = null;
-let currentUserId = null;
+let currentUid = null;
+let saveTimer = null;
+let onSaveError = null;
 
-export function loadData(userId) {
-  currentUserId = userId;
-  const raw = localStorage.getItem(dataKey(userId));
-  cache = raw ? JSON.parse(raw) : emptyUserData();
-  // backfill any new fields for users created by older versions
+export function setSaveErrorHandler(fn) { onSaveError = fn; }
+
+function docRef() { return doc(fs, 'userData', currentUid); }
+
+// Loads (or creates) this user's data document. Call once right after sign-in.
+export async function loadData(userId) {
+  currentUid = userId;
+  const ref = doc(fs, 'userData', userId);
+  const snap = await getDoc(ref);
   const def = emptyUserData();
-  for (const k in def) if (!(k in cache)) cache[k] = def[k];
+  if (snap.exists()) {
+    cache = snap.data();
+    for (const k in def) if (!(k in cache)) cache[k] = def[k];
+  } else {
+    cache = def;
+    await setDoc(ref, cache);
+  }
   return cache;
 }
-export function persist() {
-  if (!currentUserId) return;
-  localStorage.setItem(dataKey(currentUserId), JSON.stringify(cache));
+
+export function unloadData() {
+  cache = null;
+  currentUid = null;
+  if (saveTimer) clearTimeout(saveTimer);
 }
+
+// Debounced write-through so rapid successive edits (e.g. reordering) don't fire a
+// network write per keystroke, while still saving within a fraction of a second.
+export function persist() {
+  if (!currentUid) return;
+  const snapshotUid = currentUid;
+  const payload = JSON.parse(JSON.stringify(cache));
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    setDoc(doc(fs, 'userData', snapshotUid), payload).catch(err => {
+      console.error('WonderI: failed to save to Firestore', err);
+      if (onSaveError) onSaveError(err);
+    });
+  }, 250);
+}
+
 export function data() {
   return cache;
 }
@@ -184,12 +178,9 @@ export function habitStats(habit) {
     .sort();
   const logSet = new Set(logs);
 
-  // current streak: walk back from today over scheduled days
   let current = 0;
-  let cursor = todayStr();
+  let d = todayStr();
   const createdDate = habit.createdAt ? habit.createdAt.slice(0, 10) : '1970-01-01';
-  // allow "today not yet done" to not break streak if it's still schedulable today
-  let d = cursor;
   let guard = 0;
   while (d >= createdDate && guard < 3650) {
     guard++;
@@ -207,7 +198,6 @@ export function habitStats(habit) {
     d = prev.toISOString().slice(0, 10);
   }
 
-  // best streak: scan forward across all scheduled days since creation
   let best = 0, run = 0;
   let scan = createdDate;
   const end = todayStr();
@@ -223,7 +213,6 @@ export function habitStats(habit) {
     scan = nx.toISOString().slice(0, 10);
   }
 
-  // completion rate: completed / scheduled since creation
   let scheduled = 0, completed = 0;
   scan = createdDate;
   guard = 0;
@@ -243,7 +232,6 @@ export function habitStats(habit) {
 }
 
 export function overallStreak() {
-  // an overall "activity streak": days with at least one completed habit, task, or checkin
   const habitDates = new Set(HabitLogs.all().map(l => l.date));
   const taskDates = new Set(Tasks.all().filter(t => t.status === 'completed' && t.completedAt).map(t => t.completedAt.slice(0, 10)));
   const checkinDates = new Set(Checkins.all().map(c => c.date));
@@ -270,7 +258,6 @@ export function challengeStats(challenge) {
   const dayNum = clamp(daysBetween(challenge.startDate, today) + 1, 0, totalDays);
   const remaining = clamp(daysBetween(today, challenge.endDate), 0, totalDays);
   const progress = totalDays > 0 ? pct(logs.filter(l => l.completed).length, totalDays) : 0;
-  // streak within challenge
   let streak = 0;
   let d = today < challenge.endDate ? today : challenge.endDate;
   const logSet = new Set(logs.filter(l => l.completed).map(l => l.date));

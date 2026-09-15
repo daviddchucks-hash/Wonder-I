@@ -73,11 +73,12 @@ export function mount(rerender, onLogout) {
     const footer = `${button({ label: 'Cancel', variant: 'ghost', id: 'p-cancel' })}${button({ label: 'Save', variant: 'primary', id: 'p-save' })}`;
     openSheet(sheet('Edit profile', body, footer));
     document.getElementById('p-cancel').addEventListener('click', closeModal);
-    document.getElementById('p-save').addEventListener('click', () => {
+    document.getElementById('p-save').addEventListener('click', async () => {
       const name = document.getElementById('p-name').value.trim();
       const email = document.getElementById('p-email').value.trim();
       if (!name || !email) { toast('Name and email are required.'); return; }
-      auth.updateProfile({ name, email });
+      const res = await auth.updateProfile({ name, email });
+      if (res.error) { toast(res.error); return; }
       closeModal();
       rerender();
     });
@@ -102,21 +103,19 @@ export function mount(rerender, onLogout) {
     const body = `<form id="pw-form">
       ${inputField({ label: 'Current password', id: 'cur-pass', type: 'password' })}
       ${inputField({ label: 'New password', id: 'new-pass', type: 'password' })}
+      <p class="auth-error" id="pw-error"></p>
     </form>`;
     const footer = `${button({ label: 'Cancel', variant: 'ghost', id: 'pw-cancel' })}${button({ label: 'Update', variant: 'primary', id: 'pw-save' })}`;
     openSheet(sheet('Change password', body, footer));
     document.getElementById('pw-cancel').addEventListener('click', closeModal);
-    document.getElementById('pw-save').addEventListener('click', () => {
-      const cur = document.getElementById('cur-pass').value;
-      const next = document.getElementById('new-pass').value;
-      const res = auth.login({ email: auth.currentUser.email, password: cur });
-      if (res.error) { toast('Current password is incorrect.'); return; }
-      if (next.length < 6) { toast('New password must be at least 6 characters.'); return; }
-      import('../utils.js').then(({ simpleHash }) => {
-        auth.updateProfile({ passwordHash: simpleHash(next) });
-        closeModal();
-        toast('Password updated');
-      });
+    document.getElementById('pw-save').addEventListener('click', async () => {
+      const currentPassword = document.getElementById('cur-pass').value;
+      const newPassword = document.getElementById('new-pass').value;
+      const errEl = document.getElementById('pw-error');
+      const res = await auth.changePassword({ currentPassword, newPassword });
+      if (res.error) { errEl.textContent = res.error; return; }
+      closeModal();
+      toast('Password updated');
     });
   });
 
